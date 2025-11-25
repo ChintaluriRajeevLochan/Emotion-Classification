@@ -1,0 +1,630 @@
+from google.colab import drive
+drive.mount('/content/drive', force_remount=True)
+
+# Set your dataset folder path (you said it's inside: MyDrive/raw)
+DATA_DIR = "/content/drive/MyDrive/raw1"
+
+print("Dataset folder set to:", DATA_DIR)
+
+import os
+import glob
+
+if not os.path.exists(DATA_DIR):
+    print("❌ ERROR: Folder not found.")
+    print("➡️ Please open the left sidebar in Colab, navigate to drive/MyDrive and verify the folder name.")
+else:
+    print("✅ Folder found!")
+
+    csv_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
+    print(f"Found {len(csv_files)} CSV files.")
+
+    # Show first 10 files
+    for f in csv_files[:10]:
+        print(" →", os.path.basename(f))
+
+    if len(csv_files) == 0:
+        print("⚠️ No CSV files found in this folder. Make sure your .csv files are inside MyDrive/raw")
+
+import pandas as pd
+
+records = []
+csv_files = glob.glob(os.path.join(DATA_DIR, "*.csv"))
+
+for f in csv_files:
+    df = pd.read_csv(f)
+    records.append({"file": os.path.basename(f), "df": df})
+    print("Loaded:", os.path.basename(f), "→ shape:", df.shape)
+
+print("\n✅ Finished loading all subject files.")
+print("Total files loaded:", len(records))
+# === CELL 1 ===
+# Install dependencies (run once)
+!pip install numpy scipy scikit-learn matplotlib pandas networkx shapely tqdm seaborn
+# === CELL 2 ===
+# Mount Google Drive and set paths
+from google.colab import drive
+drive.mount('/content/drive', force_remount=True)
+
+DATA_DIR = "/content/drive/MyDrive/raw"   # your folder
+OUT_DIR = "/content/cogload_out"          # outputs (features, models, plots)
+PAPER_PDF_PATH = "/mnt/data/Nonlinear_Signal_Processing_Methods_for_Automatic_Emotion_Recognition_Using_Electrodermal_Activity.pdf"
+import os
+os.makedirs(OUT_DIR, exist_ok=True)
+
+# quick check
+if not os.path.exists(DATA_DIR):
+    raise FileNotFoundError(f"DATA_DIR not found: {DATA_DIR}. Check Colab left panel for correct path.")
+print("DATA_DIR:", DATA_DIR)
+print("OUT_DIR:", OUT_DIR)
+# === CELL 3 ===
+# Imports & reproducibility
+# === FINAL FIXED CELL 3 ===
+# Imports & reproducibility (compatible with Shapely 2.0+)
+
+import os, glob, math, json
+import numpy as np
+import pandas as pd
+
+from scipy import signal, stats
+from scipy.fft import fft
+from scipy.spatial import Delaunay
+
+from sklearn.model_selection import LeaveOneGroupOut, GroupShuffleSplit
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.svm import SVC
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.naive_bayes import GaussianNB
+from sklearn.metrics import (
+    precision_recall_fscore_support,
+    accuracy_score,
+    confusion_matrix,
+    classification_report,
+)
+from sklearn.decomposition import PCA
+from sklearn.cluster import KMeans
+from sklearn.feature_selection import SelectKBest, f_classif
+
+import networkx as nx
+
+# --- SHAPELY FIX FOR COLAB ---
+# shapely ≥ 2.0 removed cascaded_union → use unary_union instead
+from shapely.geometry import Point, MultiPoint, Polygon, LineString
+from shapely.ops import unary_union
+
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import warnings
+warnings.filterwarnings("ignore")
+
+# Reproducibility
+RNG_SEED = 42
+np.random.seed(RNG_SEED)
+
+print("Cell 3 loaded successfully (Shapely unary_union fix applied).")
+# === CELL 4 ===
+# Loader: read CSVs from DATA_DIR and create records list
+def infer_fs_from_timestamp(ts):
+    diffs = np.diff(ts.astype(float))
+    if len(diffs)==0: return None
+    med = np.median(diffs)
+    if med > 1e9: med_s = med/1e9
+    elif med > 1e6: med_s = med/1e6
+    elif med > 1e3: med_s = med/1e3
+    else: med_s = med
+    if med_s <= 0: return None
+    fs = int(round(1.0/med_s))
+    fs = max(1, min(fs, 2000))
+    return fs
+
+def load_subject_files_from_folder(folder, eda_col='gsr', ts_col='timestamp', user_col='user_id'):
+    files = sorted(glob.glob(os.path.join(folder, "*.csv")))
+    if not files:
+        raise FileNotFoundError(f"No .csv files found in {folder}")
+    records=[]
+    for f in files:
+        df = pd.read_csv(f)
+        subj = str(df[user_col].iloc[0]) if user_col in df.columns else os.path.splitext(os.path.basename(f))[0]
+        # eda column detection
+        if eda_col in df.columns:
+            eda = df[eda_col].astype(float).values
+        else:
+            found=False
+            for alt in ['eda','GSR','gsr_raw','skin_conductance','conductance']:
+                if alt in df.columns:
+                    eda = df[alt].astype(float).values; found=True; break
+            if not found:
+                raise ValueError(f"No EDA column found in {f}; expected 'gsr' or alternatives")
+        fs = None
+        if ts_col in df.columns:
+            try:
+                fs = infer_fs_from_timestamp(df[ts_col].values)
+            except:
+                fs = None
+        if fs is None:
+            fs = 4   # default fallback; change if your signals are higher rate
+        records.append({'subject':subj, 'trial':os.path.basename(f), 'eda':eda, 'fs':int(fs), 'df':df})
+    return records
+
+records = load_subject_files_from_folder(DATA_DIR)
+print(f"Loaded {len(records)} files. Example subject:", records[0]['subject'], "fs:", records[0]['fs'])
+# === CELL 5 ===
+# Feature extraction functions (same as earlier; safe defaults)
+def segment_eda(eda, fs=4, win_s=60, overlap=0.5):
+    N = len(eda); win = int(win_s * fs)
+    if win < 1: win = N
+    step = max(1, int(win * (1-overlap)))
+    segs=[]
+    for start in range(0, max(1, N-win+1), step):
+        seg = eda[start:start+win]
+        if len(seg)==win: segs.append(seg)
+    return segs
+
+def zscore(x): return (x - np.nanmean(x)) / (np.nanstd(x) + 1e-12)
+
+# isax
+def paa(x, n_segments=32):
+    N=len(x); idxs=np.linspace(0,N,n_segments+1, dtype=int); res=[]
+    for i in range(n_segments):
+        a,b = idxs[i], idxs[i+1]; res.append(x[a:b].mean() if b>a else 0.0)
+    return np.array(res)
+
+def discretize_paa(paa_vals, alphabet_size=4):
+    probs = np.linspace(0,1,alphabet_size+1)[1:-1]; bps = stats.norm.ppf(probs)
+    syms = np.digitize(paa_vals, bps); return ''.join([chr(ord('a')+s) for s in syms])
+
+def pattern_transition_probs(symbols, l=2):
+    total = max(0, len(symbols)-l+1); counts={}
+    for i in range(total):
+        sub = symbols[i:i+l]; counts[sub]=counts.get(sub,0)+1
+    return {k:v/total for k,v in counts.items()} if total>0 else {}
+
+def shannon_entropy_from_probs(probs):
+    if not probs: return 0.0
+    p = np.array(list(probs.values())); p = p[p>0]; return -np.sum(p*np.log2(p))
+
+def isax_features(segment, fs=4, n_paa=32):
+    x = zscore(segment); res={}
+    p = paa(x, n_paa); sym = discretize_paa(p, alphabet_size=4)
+    res['isax_time_entropy'] = shannon_entropy_from_probs(pattern_transition_probs(sym,2))
+    dx = np.diff(x, prepend=x[0]); p2 = paa(dx, n_paa)
+    res['isax_deriv_entropy'] = shannon_entropy_from_probs(pattern_transition_probs(discretize_paa(p2,4),2))
+    return res
+
+# comEDA
+def time_delay_embedding(x, m=3, tau=1):
+    N=len(x)
+    if N - (m-1)*tau <= 0: return np.zeros((0,m))
+    return np.array([x[i:i+m*tau:tau] for i in range(0, N-(m-1)*tau)])
+def angular_distances(emb):
+    if emb.shape[0]<2: return np.array([])
+    norms = np.linalg.norm(emb, axis=1, keepdims=True)+1e-12; embn = emb / norms
+    D = np.clip(embn @ embn.T, -1.0, 1.0); angles = np.arccos(D); iu = np.triu_indices_from(angles, k=1)
+    return angles[iu]
+def renyi_quadratic_entropy_from_angles(angles):
+    if angles.size==0: return 0.0
+    nbins = int(np.ceil(np.log2(len(angles)+1))+1)
+    hist,_ = np.histogram(angles, bins=nbins, density=True); p = hist/(hist.sum()+1e-12)
+    return -np.log2(np.sum(p**2)+1e-12)
+def com_features(segment):
+    emb = time_delay_embedding(segment, m=3, tau=1); ang = angular_distances(emb)
+    return {'com_RnEn': renyi_quadratic_entropy_from_angles(ang)}
+
+# topEDA (alpha-shape on DFT points)
+def alpha_shape(points, alpha=0.1):
+    try:
+        if len(points) < 4: return MultiPoint(points).convex_hull
+        tri = Delaunay(points); triangles = points[tri.simplices]
+        def circumradius(pa,pb,pc):
+            A=np.linalg.norm(pb-pc); B=np.linalg.norm(pa-pc); C=np.linalg.norm(pa-pb)
+            s=(A+B+C)/2.0; area=max(1e-12, np.sqrt(abs(s*(s-A)*(s-B)*(s-C))))
+            return (A*B*C)/(4.0*area+1e-12)
+        R = np.array([circumradius(tri[0],tri[1],tri[2]) for tri in triangles])
+        keep = triangles[R < (1.0/alpha)]
+        edges=[]
+        for tri in keep: edges += [(tuple(tri[i]), tuple(tri[(i+1)%3])) for i in range(3)]
+        edges_set = set(tuple(sorted(e)) for e in edges)
+        line_strings = [LineString([e[0], e[1]]) for e in edges_set]
+        if not line_strings: return MultiPoint(points).convex_hull
+        merged = cascaded_union(line_strings)
+        try: poly = Polygon(merged.buffer(0).exterior); return poly
+        except: return merged
+    except:
+        return MultiPoint(points).convex_hull
+
+def top_features(segment, fs=4, dft_len=None, alpha=0.1):
+    N=len(segment); dft_len = dft_len or max(1,N)
+    X=fft(segment, n=dft_len); half = dft_len//2
+    pts = np.vstack([np.real(X[:half]), np.imag(X[:half])]).T
+    ashape = alpha_shape(pts, alpha=max(1e-6, alpha))
+    if isinstance(ashape, Polygon):
+        area = ashape.area; perim = ashape.length; bbox = ashape.bounds
+        width = bbox[2]-bbox[0]; height = bbox[3]-bbox[1]
+        ecc = (max(width,height)/(min(width,height)+1e-12)) if min(width,height)>0 else 0.0
+        return {'top_area': area, 'top_perim': perim, 'top_ecc': ecc}
+    return {'top_area': 0.0, 'top_perim': 0.0, 'top_ecc': 0.0}
+
+# netEDA (HVG on STFT mean time-series)
+def stft_mag(segment, fs=4, nperseg=256, noverlap=None):
+    try:
+        f,t,Zxx = signal.stft(segment, fs=fs, nperseg=min(nperseg, len(segment)), noverlap=noverlap)
+        return np.abs(Zxx)
+    except:
+        return np.abs(np.atleast_2d(np.fft.rfft(segment)))
+
+def horizontal_visibility_graph(signal_1d):
+    N=len(signal_1d); G=nx.Graph(); G.add_nodes_from(range(N))
+    for i in range(N):
+        for j in range(i+1, N):
+            visible=True
+            m = min(signal_1d[i], signal_1d[j])
+            for k in range(i+1, j):
+                if signal_1d[k] > m:
+                    visible=False; break
+            if visible: G.add_edge(i,j)
+    return G
+
+def net_features(segment, fs=4):
+    Z = stft_mag(segment, fs=fs, nperseg=64)
+    vec = Z.mean(axis=0) if Z.size>0 else np.zeros(1)
+    G = horizontal_visibility_graph(vec)
+    try: assort = nx.degree_pearson_correlation_coefficient(G) if G.number_of_edges()>0 else 0.0
+    except: assort = 0.0
+    try: clustering = np.mean(list(nx.clustering(G).values())) if G.number_of_nodes()>0 else 0.0
+    except: clustering = 0.0
+    degrees = np.array([d for n,d in G.degree()]) if G.number_of_nodes()>0 else np.array([0])
+    avg_deg = degrees.mean()
+    try:
+        diam = nx.diameter(G) if nx.is_connected(G) else max([nx.diameter(G.subgraph(c)) for c in nx.connected_components(G)])
+    except:
+        diam = 0
+    return {'net_assort':assort, 'net_clust':clustering, 'net_avgdeg':avg_deg, 'net_diam':diam}
+
+# traditional features
+def traditional_eda_features(segment, fs=4):
+    x = segment
+    feats = {}
+    feats['mean'] = float(np.mean(x))
+    feats['std'] = float(np.std(x))
+    feats['skew'] = float(stats.skew(x)) if len(x)>2 else 0.0
+    feats['kurt'] = float(stats.kurtosis(x)) if len(x)>3 else 0.0
+    thr = np.percentile(x, 75) + (np.std(x) * 0.5)
+    peaks = signal.find_peaks(x, height=thr)[0] if len(x)>1 else []
+    feats['nsSCR_count'] = int(len(peaks))
+    f,Pxx = signal.welch(x, fs=fs, nperseg=min(256, len(x))) if len(x)>1 else (np.array([0.]), np.array([0.]))
+    feats['psd_total'] = float(np.trapz(Pxx, f)) if Pxx.size>0 else 0.0
+    return feats
+# === CELL 6 ===
+# Extract features for all records (may take some time). Save features_table.csv
+def extract_features_for_record(record, params):
+    fs = record.get('fs', params.get('fs',4))
+    segments = segment_eda(record['eda'], fs=fs, win_s=params.get('win_s',60), overlap=params.get('overlap',0.5))
+    feats=[]
+    for seg in segments:
+        segf = {}
+        segf.update(isax_features(seg, fs=fs, n_paa=params.get('n_paa',32)))
+        segf.update(com_features(seg))
+        segf.update(top_features(seg, fs=fs, alpha=params.get('alpha',0.1)))
+        segf.update(net_features(seg, fs=fs))
+        segf.update(traditional_eda_features(seg, fs=fs))
+        segf['subject'] = record['subject']; segf['trial'] = record.get('trial')
+        segf['start_sample'] = None; segf['end_sample'] = None
+        segf['label'] = None   # will be replaced by cluster label
+        feats.append(segf)
+    return feats
+
+def extract_features(records, params):
+    rows=[]
+    for rec in tqdm(records):
+        rows += extract_features_for_record(rec, params)
+    df = pd.DataFrame(rows)
+    return df
+
+params = {'fs':None, 'win_s':60, 'overlap':0.5, 'n_paa':32, 'alpha':0.1}
+df = extract_features(records, params)
+feat_csv = os.path.join(OUT_DIR, "features_table.csv")
+df.to_csv(feat_csv, index=False)
+print("Saved features to", feat_csv)
+print("Feature table shape:", df.shape)
+df.head()
+# === CELL 7 ===
+# Clustering (KMeans with k=4) to produce pseudo-labels
+k = 3
+numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+X_all = df[numeric_cols].fillna(0).values
+
+# scale then cluster
+scaler = StandardScaler()
+Xs_all = scaler.fit_transform(X_all)
+
+kmeans = KMeans(n_clusters=k, random_state=RNG_SEED, n_init=20)
+clusters = kmeans.fit_predict(Xs_all)
+df['cluster_label'] = clusters.astype(int)
+
+# show cluster counts
+print("Cluster counts:")
+print(df['cluster_label'].value_counts().sort_index())
+
+# save clustered features
+df.to_csv(os.path.join(OUT_DIR, "features_with_clusters.csv"), index=False)
+print("Saved features_with_clusters.csv")
+# === CELL 8 ===
+# Split by subject into train/test (GroupShuffleSplit)
+from sklearn.model_selection import GroupShuffleSplit
+
+# We'll split subjects so no subject appears in both sets
+subjects = df['subject'].values
+unique_subjects = np.unique(subjects)
+gss = GroupShuffleSplit(n_splits=1, test_size=0.27
+                        , random_state=RNG_SEED)
+train_idx, test_idx = next(gss.split(df, groups=subjects))
+
+train_df = df.iloc[train_idx].reset_index(drop=True)
+test_df  = df.iloc[test_idx].reset_index(drop=True)
+print("Train windows:", train_df.shape[0], "| Test windows:", test_df.shape[0])
+print("Train subjects:", len(train_df['subject'].unique()), "| Test subjects:", len(test_df['subject'].unique()))
+# === CELL 9 (REPLACEMENT) ===
+# Realistic train accuracy (GroupKFold CV on train set) + final test evaluation
+from sklearn.pipeline import make_pipeline
+from sklearn.model_selection import GroupKFold, cross_val_predict
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import seaborn as sns
+import matplotlib.pyplot as plt
+import joblib
+import json
+import numpy as np
+import os
+
+# Prepare numeric columns and matrices (same as before)
+numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+
+X_train = train_df[numeric_cols].fillna(0).values
+y_train = train_df['cluster_label'].values
+groups_train = train_df['subject'].values
+
+X_test = test_df[numeric_cols].fillna(0).values
+y_test = test_df['cluster_label'].values
+groups_test = test_df['subject'].values
+
+# Reduced-complexity RandomForest to avoid heavy memorization
+rf_params = {
+    "n_estimators": 100,
+    "max_depth": 12,           # limit depth
+    "min_samples_leaf": 5,     # require leaves to have at least 5 samples
+    "random_state": RNG_SEED,
+    "n_jobs": -1
+}
+
+# Select number of features (you can tweak)
+K_FEATURES = min(30, X_train.shape[1])
+
+# Build pipeline: scaler -> feature selector -> classifier
+pipeline = make_pipeline(
+    StandardScaler(),
+    SelectKBest(score_func=f_classif, k=K_FEATURES),
+    RandomForestClassifier(**rf_params)
+)
+
+# Use GroupKFold on subjects to produce cross-validated predictions for the TRAINING set
+n_splits = min(5, len(np.unique(groups_train)))  # up to 5 folds but <= number of train subjects
+gkf = GroupKFold(n_splits=n_splits)
+
+# cross_val_predict gives out-of-fold predictions for each training sample (no leakage)
+y_train_pred_oof = cross_val_predict(pipeline, X_train, y_train, groups=groups_train, cv=gkf, n_jobs=-1)
+
+# Compute realistic TRAIN (CV) accuracy
+cv_train_acc = accuracy_score(y_train, y_train_pred_oof)
+print(f"Train (GroupKFold CV) accuracy: {cv_train_acc*100:.2f}%")
+
+# Fit pipeline on full train set (so final model is trained on all train data)
+pipeline.fit(X_train, y_train)
+
+# Save selected feature names (from selector inside pipeline)
+# Extract selected feature indices
+selector = pipeline.named_steps['selectkbest']
+selected_idx = selector.get_support(indices=True)
+selected_feature_names = [numeric_cols[i] for i in selected_idx]
+with open(os.path.join(OUT_DIR, "selected_features.json"), "w") as f:
+    json.dump(selected_feature_names, f)
+print("Selected features saved:", selected_feature_names)
+
+# Evaluate on train (full) — optional, but we will show it only for info (this often will be high)
+y_train_full_pred = pipeline.predict(X_train)
+train_full_acc = accuracy_score(y_train, y_train_full_pred)
+print(f"Train (fit-on-all) accuracy: {train_full_acc*100:.2f}%  (expected higher than CV)")
+
+# Evaluate on test set (held-out subjects)
+y_test_pred = pipeline.predict(X_test)
+test_acc = accuracy_score(y_test, y_test_pred)
+print(f"Test accuracy (held-out subjects): {test_acc*100:.2f}%")
+
+# Classification report (test)
+print("\nClassification report (test):")
+print(classification_report(y_test, y_test_pred, zero_division=0))
+
+# Confusion matrix (test)
+cm = confusion_matrix(y_test, y_test_pred)
+plt.figure(figsize=(6,5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues')
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.title("Confusion Matrix (Test Set)")
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "confusion_matrix_test.png"))
+plt.show()
+
+# Save model and pipeline
+joblib.dump(pipeline, os.path.join(OUT_DIR, "rf_pipeline.joblib"))
+print("Saved pipeline to", os.path.join(OUT_DIR, "rf_pipeline.joblib"))
+# --- GridSearch + balanced SVM with GroupKFold  ---
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.svm import SVC
+from sklearn.model_selection import GridSearchCV, GroupKFold, cross_val_predict
+from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
+import numpy as np
+
+# Safety: ensure no label leakage
+numeric_cols = [c for c in df.select_dtypes(include=[np.number]).columns if c != 'cluster_label']
+
+# Prepare matrices
+X_train = train_df[numeric_cols].fillna(0).values
+y_train = train_df['cluster_label'].values
+groups_train = train_df['subject'].values
+
+X_test = test_df[numeric_cols].fillna(0).values
+y_test = test_df['cluster_label'].values
+
+# Reduce number of features to make model simpler (tweak k)
+K_FEATS = min(15, X_train.shape[1])   # try 10-20; 15 is reasonable
+
+pipe = Pipeline([
+    ('scaler', StandardScaler()),
+    ('skb', SelectKBest(score_func=f_classif, k=K_FEATS)),
+    ('svc', SVC(kernel='rbf', class_weight='balanced', probability=False, random_state=RNG_SEED))
+])
+
+param_grid = {
+    'svc__C': [0.01, 0.1, 1, 5, 10],
+    'svc__gamma': ['scale', 0.1, 0.01, 0.001]
+}
+
+gkf = GroupKFold(n_splits=min(5, len(np.unique(groups_train))))
+grid = GridSearchCV(pipe, param_grid, cv=gkf, scoring='accuracy', n_jobs=-1, verbose=2)
+
+# Note: pass groups to fit so GroupKFold is used correctly
+grid.fit(X_train, y_train, groups=groups_train)
+
+print("Best params:", grid.best_params_)
+print("Best CV score (GroupKFold):", grid.best_score_)
+
+best_model = grid.best_estimator_
+
+# realistic train (out-of-fold) accuracy using cross_val_predict with GroupKFold
+y_train_oof = cross_val_predict(best_model, X_train, y_train, groups=groups_train, cv=gkf, n_jobs=-1)
+print("Train (GroupKFold CV) accuracy (oof):", accuracy_score(y_train, y_train_oof))
+
+# Evaluate on held-out test set
+y_test_pred = best_model.predict(X_test)
+print("Test accuracy:", accuracy_score(y_test, y_test_pred))
+print("\nClassification report (test):\n", classification_report(y_test, y_test_pred, zero_division=0))
+print("Confusion matrix (test):\n", confusion_matrix(y_test, y_test_pred))
+# === CONFUSION MATRIX IMAGE GENERATION ===
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+import numpy as np
+import os
+
+# Pick your model here:
+# If you used GridSearch SVM:
+model = best_model
+
+# Or if you want RandomForest:
+# model = pipeline   # RF pipeline from Cell 9
+
+# Prepare test data
+X_test = test_df[numeric_cols].fillna(0).values
+y_test = test_df['cluster_label'].values
+
+# Predict
+y_pred = model.predict(X_test)
+
+# Compute Confusion Matrix
+cm = confusion_matrix(y_test, y_pred)
+labels = np.unique(y_test)
+
+plt.figure(figsize=(8,6))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=labels, yticklabels=labels)
+plt.title("Confusion Matrix (Test Set)")
+plt.xlabel("Predicted")
+plt.ylabel("True")
+plt.tight_layout()
+
+# Save image
+out_path = os.path.join(OUT_DIR, "confusion_matrix.png")
+plt.savefig(out_path, dpi=200)
+plt.show()
+
+print("Saved image to:", out_path)
+# === CELL 10 ===
+# Quick visual: PCA projection colored by cluster (all windows)
+from sklearn.decomposition import PCA
+pca = PCA(n_components=2, random_state=RNG_SEED)
+proj = pca.fit_transform(Xs_all)
+plt.figure(figsize=(7,5))
+sns.scatterplot(x=proj[:,0], y=proj[:,1], hue=df['cluster_label'], palette='tab10', s=20)
+plt.title("PCA projection of windows (colored by KMeans cluster)")
+plt.xlabel("PC1"); plt.ylabel("PC2")
+plt.legend(title="cluster")
+plt.tight_layout()
+plt.savefig(os.path.join(OUT_DIR, "pca_clusters.png"))
+plt.show()
+# ==== FIX: Recompute scaler, PCA on correct numeric_cols ====
+X_all_raw = df[numeric_cols].fillna(0).values
+scaler = StandardScaler()
+Xs_all = scaler.fit_transform(X_all_raw)
+
+pca = PCA(n_components=2, random_state=RNG_SEED)
+proj = pca.fit_transform(Xs_all)
+
+# ==== Continue SVM visualization ====
+from sklearn.svm import SVC
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+X_train_raw = train_df[numeric_cols].fillna(0).values
+X_test_raw  = test_df[numeric_cols].fillna(0).values
+
+X_train_s = scaler.transform(X_train_raw)
+X_test_s  = scaler.transform(X_test_raw)
+
+train_proj = pca.transform(X_train_s)
+test_proj  = pca.transform(X_test_s)
+
+y_train = train_df['cluster_label'].values.astype(int)
+y_test  = test_df['cluster_label'].values.astype(int)
+
+svm_train = SVC(kernel='rbf', C=1.0, gamma='scale')
+svm_train.fit(train_proj, y_train)
+
+all_proj = np.vstack([proj, train_proj, test_proj])
+x_min, x_max = all_proj[:,0].min() - 0.5, all_proj[:,0].max() + 0.5
+y_min, y_max = all_proj[:,1].min() - 0.5, all_proj[:,1].max() + 0.5
+
+xx, yy = np.meshgrid(
+    np.linspace(x_min, x_max, 500),
+    np.linspace(y_min, y_max, 500)
+)
+grid = np.c_[xx.ravel(), yy.ravel()]
+Z = svm_train.predict(grid).reshape(xx.shape)
+
+plt.figure(figsize=(10,7))
+plt.contourf(xx, yy, Z, alpha=0.25, cmap='tab10')
+
+sns.scatterplot(x=train_proj[:,0], y=train_proj[:,1], hue=y_train,
+                palette='tab10', s=30, edgecolor='k', linewidth=0.2)
+sns.scatterplot(x=test_proj[:,0], y=test_proj[:,1], hue=y_test,
+                palette='tab10', s=80, marker='X', edgecolor='white', linewidth=0.5, legend=False)
+
+plt.title("SVM Decision Boundary (Train) with Test Points")
+plt.xlabel("PC1"); plt.ylabel("PC2")
+plt.show()
+# === CELL 11 ===
+# Final summary
+print("Done.")
+print("Feature table:", os.path.join(OUT_DIR, "features_table.csv"))
+print("Clustered features:", os.path.join(OUT_DIR, "features_with_clusters.csv"))
+print("Confusion matrix (image):", os.path.join(OUT_DIR, "confusion_matrix_test.png"))
+print("Saved model:", os.path.join(OUT_DIR, "rf_cluster_model.joblib"))
+print("Paper used for reference:", PAPER_PDF_PATH, ":contentReference[oaicite:1]{index=1}")
+
+
